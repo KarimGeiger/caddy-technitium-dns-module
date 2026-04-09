@@ -67,7 +67,7 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 		p.TTL = caddy.Duration(120 * time.Second)
 	}
 	if p.CleanupDelay == 0 {
-		p.CleanupDelay = caddy.Duration(120 * time.Second)
+		p.CleanupDelay = caddy.Duration(60 * time.Second)
 	}
 
 	// Create HTTP client
@@ -162,6 +162,15 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 
 		appendedRecords = append(appendedRecords, record)
 		p.logger.Info("Added TXT record", zap.String("name", name), zap.String("value", recordData.Data))
+	}
+
+	if len(appendedRecords) > 0 {
+		p.logger.Info("Waiting for DNS record to propagate", zap.Duration("delay", 10*time.Second))
+		select {
+		case <-time.After(10 * time.Second):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
 	return appendedRecords, nil
