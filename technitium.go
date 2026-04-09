@@ -34,6 +34,12 @@ type Provider struct {
 	// TTL for TXT records (default: 120s)
 	TTL caddy.Duration `json:"ttl,omitempty"`
 
+	// CleanupDelay is how long to wait before deleting a TXT record after the
+	// ACME challenge has been submitted. Let's Encrypt performs secondary
+	// validation after the challenge is submitted but before polling completes,
+	// so the record must remain present during that window. (default: 120s)
+	CleanupDelay caddy.Duration `json:"cleanup_delay,omitempty"`
+
 	logger *zap.Logger
 	client *http.Client
 }
@@ -56,6 +62,9 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 	}
 	if p.TTL == 0 {
 		p.TTL = caddy.Duration(120 * time.Second)
+	}
+	if p.CleanupDelay == 0 {
+		p.CleanupDelay = caddy.Duration(120 * time.Second)
 	}
 
 	// Create HTTP client
@@ -102,6 +111,15 @@ func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Err(err.Error())
 				}
 				p.TTL = caddy.Duration(dur)
+			case "cleanup_delay":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := time.ParseDuration(d.Val())
+				if err != nil {
+					return d.Err(err.Error())
+				}
+				p.CleanupDelay = caddy.Duration(dur)
 			default:
 				return d.Errf("unrecognized subdirective '%s'", d.Val())
 			}
@@ -148,6 +166,16 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 
 // DeleteRecords removes records from the zone
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+	if p.CleanupDelay > 0 {
+		p.logger.Info("Waiting before deleting TXT records to allow ACME secondary validation",
+			zap.Duration("delay", time.Duration(p.CleanupDelay)))
+		select {
+		case <-time.After(time.Duration(p.CleanupDelay)):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	var deletedRecords []libdns.Record
 
 	for _, record := range records {
