@@ -1,6 +1,6 @@
 # Caddy DNS Provider Module for Technitium
 
-> [!WARNING]  
+> [!WARNING]
 > This module was made using an LLM and I have **not** done a lot of testing. It works for my homelab but no guarantees it will work for your situation. Please report (or better yet, open PRs for) any issues. I'll try and keep an eye on any PRs and review/merge as best as I can.
 
 This package contains a DNS provider module for Caddy that integrates with Technitium DNS Server to solve ACME DNS-01 challenges automatically.
@@ -158,20 +158,22 @@ export TECHNITIUM_API_TOKEN="your_api_token_here"
 
 ## Configuration Options
 
-| Option         | Type     | Default  | Description                                                                   |
-| -------------- | -------- | -------- | ----------------------------------------------------------------------------- |
-| `server_url`   | string   | Required | Base URL of your Technitium DNS server (e.g., `https://dns.example.com:5380`) |
-| `api_token`    | string   | Required | API token for authentication                                                  |
-| `http_timeout` | duration | `30s`    | HTTP timeout for API requests                                                 |
-| `ttl`          | duration | `120s`   | TTL for TXT records used in challenges                                        |
+| Option          | Type     | Default  | Description                                                                   |
+| --------------- | -------- | -------- | ----------------------------------------------------------------------------- |
+| `server_url`    | string   | Required | Base URL of your Technitium DNS server (e.g., `https://dns.example.com:5380`) |
+| `api_token`     | string   | Required | API token for authentication                                                  |
+| `http_timeout`  | duration | `30s`    | HTTP timeout for API requests                                                 |
+| `ttl`           | duration | `120s`   | TTL for TXT records used in challenges                                        |
+| `cleanup_delay` | duration | `60s`    | How long to keep the TXT record alive after the ACME challenge is submitted. acmez calls cleanup before polling for the validation result, so the record must remain present while Let's Encrypt validates. The deletion runs in the background so it does not block the challenge. Set to `0s` to disable. |
 
 ## How It Works
 
 1. When Caddy needs to obtain/renew a certificate, it triggers the DNS-01 challenge
 2. The plugin creates a TXT record at `_acme-challenge.yourdomain.com` using Technitium's API
-3. Let's Encrypt validates the challenge by querying the DNS record
-4. After validation, the plugin automatically deletes the challenge record
-5. Caddy completes the certificate issuance process
+3. A short propagation delay allows the record to become visible to Let's Encrypt's validators
+4. Let's Encrypt validates the challenge by querying the DNS record
+5. The plugin schedules the challenge record for deletion in the background, keeping it alive long enough for Let's Encrypt's secondary validation to complete
+6. Caddy completes the certificate issuance process
 
 ## Security Considerations
 
@@ -188,6 +190,7 @@ export TECHNITIUM_API_TOKEN="your_api_token_here"
 2. **"Connection refused"**: Verify Technitium server is running and accessible
 3. **"Domain not found"**: Ensure Technitium is authoritative for your domain
 4. **Certificate not obtained**: Check Caddy logs for detailed error messages
+5. **DNS-01 challenge fails with NXDOMAIN**: Let's Encrypt could not see the TXT record during validation. Try increasing `cleanup_delay` (e.g. `120s`) to give secondary validators more time.
 
 ### Debug Steps
 
