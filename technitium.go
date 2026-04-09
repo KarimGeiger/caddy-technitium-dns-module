@@ -34,14 +34,16 @@ type Provider struct {
 	// TTL for TXT records (default: 120s)
 	TTL caddy.Duration `json:"ttl,omitempty"`
 
-	// CleanupDelay is how long to wait before deleting a TXT record after the
-	// ACME challenge has been submitted. Let's Encrypt performs secondary
-	// validation after the challenge is submitted but before polling completes,
-	// so the record must remain present during that window. (default: 120s)
+	// CleanupDelay is how long to keep the TXT record alive after CleanUp is
+	// called. acmez calls CleanUp before polling for the authorization result,
+	// so the record must stay present while Let's Encrypt performs its
+	// validation. The deletion is done in a background goroutine so polling
+	// is not blocked. (default: 120s)
 	CleanupDelay caddy.Duration `json:"cleanup_delay,omitempty"`
 
 	logger *zap.Logger
 	client *http.Client
+	ctx    context.Context
 }
 
 // CaddyModule returns the Caddy module information
@@ -55,6 +57,7 @@ func (Provider) CaddyModule() caddy.ModuleInfo {
 // Provision sets up the provider
 func (p *Provider) Provision(ctx caddy.Context) error {
 	p.logger = ctx.Logger()
+	p.ctx = ctx
 
 	// Set defaults
 	if p.HTTPTimeout == 0 {
@@ -164,41 +167,69 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 	return appendedRecords, nil
 }
 
-// DeleteRecords removes records from the zone
+// DeleteRecords removes records from the zone.
+// If CleanupDelay is set, the actual deletion is deferred to a background
+// goroutine so that acmez can proceed to poll the authorization immediately —
+// the record stays alive for LE's validators while polling is in progress.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	if p.CleanupDelay > 0 {
-		p.logger.Info("Waiting before deleting TXT records to allow ACME secondary validation",
-			zap.Duration("delay", time.Duration(p.CleanupDelay)))
-		select {
-		case <-time.After(time.Duration(p.CleanupDelay)):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	// Collect the records we will delete (filter + resolve names now, while we
+	// still have the caller's context).
+	type pendingRecord struct {
+		name  string
+		value string
+		orig  libdns.Record
 	}
-
-	var deletedRecords []libdns.Record
-
+	var pending []pendingRecord
 	for _, record := range records {
-		var recordData = record.RR()
+		recordData := record.RR()
 		if recordData.Type != "TXT" {
-			continue // Only handle TXT records for ACME challenges
+			continue
 		}
-
-		// Clean up the record name and zone
 		name := strings.TrimSuffix(recordData.Name, ".")
 		if !strings.HasSuffix(name, zone) {
 			name = name + "." + strings.TrimSuffix(zone, ".")
 		}
-
-		err := p.deleteRecord(name, recordData.Data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to delete TXT record for %s: %v", name, err)
-		}
-
-		deletedRecords = append(deletedRecords, record)
-		p.logger.Info("Deleted TXT record", zap.String("name", name), zap.String("value", recordData.Data))
+		pending = append(pending, pendingRecord{name: name, value: recordData.Data, orig: record})
 	}
 
+	if p.CleanupDelay > 0 {
+		// Return immediately so acmez can poll the authorization while the
+		// record is still live. The deletion happens in the background.
+		p.logger.Info("Deferring TXT record deletion to background",
+			zap.Duration("delay", time.Duration(p.CleanupDelay)))
+		go func() {
+			timer := time.NewTimer(time.Duration(p.CleanupDelay))
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-p.ctx.Done():
+				return
+			}
+			for _, pr := range pending {
+				if err := p.deleteRecord(pr.name, pr.value); err != nil {
+					p.logger.Error("Failed to delete TXT record (background)", zap.String("name", pr.name), zap.Error(err))
+					continue
+				}
+				p.logger.Info("Deleted TXT record", zap.String("name", pr.name), zap.String("value", pr.value))
+			}
+		}()
+
+		var result []libdns.Record
+		for _, pr := range pending {
+			result = append(result, pr.orig)
+		}
+		return result, nil
+	}
+
+	// No delay — delete synchronously.
+	var deletedRecords []libdns.Record
+	for _, pr := range pending {
+		if err := p.deleteRecord(pr.name, pr.value); err != nil {
+			return nil, fmt.Errorf("failed to delete TXT record for %s: %v", pr.name, err)
+		}
+		deletedRecords = append(deletedRecords, pr.orig)
+		p.logger.Info("Deleted TXT record", zap.String("name", pr.name), zap.String("value", pr.value))
+	}
 	return deletedRecords, nil
 }
 
