@@ -1,4 +1,4 @@
-module github.com/simonvandermeer/caddy-technitium-dns-module
+module github.com/KarimGeiger/caddy-technitium-dns-module
 
 go 1.25
 
